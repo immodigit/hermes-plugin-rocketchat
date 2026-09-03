@@ -20,9 +20,11 @@ from gateway.platforms.helpers import MessageDeduplicator
 
 from .ddp import DdpTransportMixin
 from .helpers import (
+    CATCHUP_STATE_FILENAME,
     INBOUND_DEDUP_MAX_ENTRIES,
     INBOUND_DEDUP_TTL_SECONDS,
     MAX_MESSAGE_LENGTH,
+    CatchupState,
     _ROOM_TYPE_MAP,
     build_delegation_envelope,
     is_valid_server_identifier,
@@ -110,6 +112,17 @@ class RocketchatAdapter(
             ttl_seconds=INBOUND_DEDUP_TTL_SECONDS,
         )
 
+        # Durable watermark for catch-up after a stream gap.  Deliberately NOT
+        # resolved here: the Hermes home is profile-scoped through a
+        # context-local override that only exists once the gateway is running.
+        # Resolving at construction could hand every profile of a multi-profile
+        # gateway the same file — one agent would then replay another's rooms.
+        # connect() builds it, in the right context.
+        self._catchup: Optional[CatchupState] = None
+        # One catch-up at a time: reconnect storms must not stack up fetches.
+        self._catchup_lock = asyncio.Lock()
+        self._catchup_task: Any = None
+
         # One-shot bot-to-bot tasks. Replies in these DM rooms carry a
         # terminal result envelope so they cannot start another agent turn.
         self._delegation_tasks: OrderedDict[str, str] = OrderedDict()
@@ -163,6 +176,27 @@ class RocketchatAdapter(
         except ValueError:
             logger.error("Rocket.Chat configuration is invalid")
             return False
+
+    @staticmethod
+    def _build_catchup_state() -> Optional[CatchupState]:
+        """Load the catch-up watermark, or return ``None`` if unavailable.
+
+        A missing Hermes home is not worth failing a connection over — the
+        adapter simply runs without catch-up, exactly as it did before.
+        """
+        try:
+            from hermes_constants import get_hermes_home
+
+            state = CatchupState(get_hermes_home() / CATCHUP_STATE_FILENAME)
+            state.load()
+            return state
+        except Exception as exc:
+            logger.warning(
+                "Rocket.Chat: catch-up state unavailable (%s) — messages missed "
+                "during a reconnect will not be recovered",
+                type(exc).__name__,
+            )
+            return None
 
     async def _api_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """GET /api/v1/{path}."""
@@ -261,6 +295,9 @@ class RocketchatAdapter(
             self._base_url,
         )
 
+        if self._catchup is None:
+            self._catchup = self._build_catchup_state()
+
         # Start DDP WebSocket in background.
         self._ws_task = asyncio.create_task(self._ws_loop())
         self._mark_connected()
@@ -279,6 +316,16 @@ class RocketchatAdapter(
 
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
+
+        # Cancel before the HTTP session closes — an in-flight catch-up would
+        # otherwise fail against a closed session and log a spurious error.
+        catchup_task = getattr(self, "_catchup_task", None)
+        if catchup_task is not None and not catchup_task.done():
+            catchup_task.cancel()
+            try:
+                await catchup_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         if self._ws:
             await self._ws.close()

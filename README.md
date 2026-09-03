@@ -162,6 +162,9 @@ The adapter reconnects automatically (exponential backoff 2–60s), but a too-ag
 | `ROCKETCHAT_AGENT_WRITE_TRUSTED_USERS` | — | `""` | Exact user IDs allowed to perform privileged actions and cross-room writes |
 | `ROCKETCHAT_AGENT_TOOLS_ALLOW_EXTERNAL` | — | `false` | Permit enabled write tools to be called from a non-Rocket.Chat or contextless session |
 | `ROCKETCHAT_WS_HEARTBEAT_SECONDS` | — | `30` | DDP WebSocket keepalive interval in seconds (clamped 5–300). Only the literal value `0` disables keepalive; invalid values keep the default. Without it a half-open socket silently stops all inbound traffic. |
+| `ROCKETCHAT_CATCHUP` | — | `true` | After every reconnect, re-read messages posted while the stream was down. Rocket.Chat keeps no backlog, so without this they are lost silently |
+| `ROCKETCHAT_CATCHUP_MAX_AGE_SECONDS` | — | `3600` | How far back a catch-up may reach. An outage longer than this leaves its messages unread on purpose |
+| `ROCKETCHAT_CATCHUP_MAX_MESSAGES` | — | `20` | Replay cap per room and reconnect (1–200). An overall cap of 100 messages per run applies on top |
 | `ROCKETCHAT_ALLOW_INSECURE_HTTP` | — | `false` | Permit a plain HTTP server URL; only suitable for an isolated trusted network |
 | `ROCKETCHAT_AGENT_RESPONSE_MAX_BYTES` | — | `2097152` | Maximum JSON body for every Rocket.Chat REST response (2 MiB; accepted range 64 KiB–16 MiB) |
 | `ROCKETCHAT_AGENT_MAX_CONCURRENCY` | — | `4` | Maximum concurrent agent REST calls in this process |
@@ -272,7 +275,8 @@ not replace least privilege at the server.
 | Thread support | ✅ Clarifications and follow-ups stay under the channel/group root via `tmid`; DMs stay flat |
 | Mention gating | ✅ Configurable per room |
 | Typing indicator | ✅ Rocket.Chat 8.x compatible |
-| Reconnect | ✅ Exponential backoff (2s–60s) |
+| Reconnect | ✅ Exponential backoff (2s–60s), keepalive-armed socket |
+| Catch-up after a gap | ✅ Bounded replay of messages missed while the stream was down |
 | Voice message → STT | ✅ ffmpeg MP3 conversion pipeline |
 | Emoji reactions | ✅ 👀✅❌ on channel messages |
 | Topic sync | ✅ Bidirectional (Hermes session title ↔ RC room topic) |

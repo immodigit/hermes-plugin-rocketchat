@@ -84,6 +84,37 @@ REPUBLISH_TOLERANCE_SECONDS = 60.0
 INBOUND_DEDUP_TTL_SECONDS = 6 * 60 * 60.0
 INBOUND_DEDUP_MAX_ENTRIES = 20_000
 
+# Catch-up after a gap in the DDP stream.
+#
+# Rocket.Chat's realtime stream has no server-side queue: whatever is posted
+# while the socket is down is never delivered, and ``connect()`` does not ask
+# for it.  A restart or a network blip therefore drops messages silently — the
+# sender sees them in the channel, the agent never does.
+#
+# The catch-up closes that window by re-reading each known room from a durable
+# watermark.  Every bound below exists to keep it from becoming the *bigger*
+# problem: an unbounded fetch would hand the agent a wall of stale messages to
+# answer at once.
+CATCHUP_STATE_FILENAME = "rocketchat_catchup.json"
+CATCHUP_STATE_VERSION = 1
+CATCHUP_DEFAULT_MAX_AGE_SECONDS = 3600.0
+CATCHUP_DEFAULT_MAX_MESSAGES = 20
+CATCHUP_MAX_ROOMS = 50
+# Overall ceiling across all rooms for one catch-up run. Per-room caps alone
+# would still permit rooms x cap messages to arrive in one burst.
+CATCHUP_MAX_TOTAL_MESSAGES = 100
+# Message ids seen most recently, kept durably. The watermark alone cannot
+# survive an unclean kill between processing a message and persisting it; this
+# list makes a re-fetched message recognizable across a restart, where the
+# in-memory dedup cache starts empty.
+CATCHUP_RECENT_ID_CAP = 500
+
+_HISTORY_ENDPOINTS = {
+    "channel": "channels.history",
+    "group": "groups.history",
+    "dm": "im.history",
+}
+
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _PERCENT_ESCAPE_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _DELEGATION_ENVELOPE_RE = re.compile(
@@ -137,6 +168,185 @@ def is_mutation_republish(post: Any) -> bool:
     if posted_at is None or updated_at is None:
         return False
     return (updated_at - posted_at) > REPUBLISH_TOLERANCE_SECONDS
+
+
+def format_rocketchat_timestamp(value: float) -> str:
+    """Render a POSIX timestamp as the ISO 8601 form the REST API expects."""
+    from datetime import datetime, timezone
+
+    return (
+        datetime.fromtimestamp(value, tz=timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def history_endpoint_for_chat_type(chat_type: Any) -> Optional[str]:
+    """Return the ``*.history`` endpoint for a normalized room type."""
+    return _HISTORY_ENDPOINTS.get(str(chat_type or "").strip().lower())
+
+
+def catchup_enabled() -> bool:
+    """Whether missed messages are re-read after the stream reconnects."""
+    return _env_flag("ROCKETCHAT_CATCHUP", default=True)
+
+
+def catchup_max_age_seconds() -> float:
+    """How far back a catch-up may reach, in seconds.
+
+    An outage longer than this leaves its messages unread on purpose: answering
+    yesterday's questions on today's reconnect is worse than staying silent, and
+    the skipped span is logged so it is never a surprise.
+    """
+    raw = os.getenv("ROCKETCHAT_CATCHUP_MAX_AGE_SECONDS", "").strip()
+    if not raw:
+        return CATCHUP_DEFAULT_MAX_AGE_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return CATCHUP_DEFAULT_MAX_AGE_SECONDS
+    if value <= 0:
+        return CATCHUP_DEFAULT_MAX_AGE_SECONDS
+    return min(value, 7 * 24 * 3600.0)
+
+
+def catchup_max_messages() -> int:
+    """Upper bound on messages replayed per room and reconnect."""
+    raw = os.getenv("ROCKETCHAT_CATCHUP_MAX_MESSAGES", "").strip()
+    if not raw:
+        return CATCHUP_DEFAULT_MAX_MESSAGES
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return CATCHUP_DEFAULT_MAX_MESSAGES
+    return min(200, max(1, value))
+
+
+class CatchupState:
+    """Durable per-room watermark plus a short memory of recent message ids.
+
+    Persisted next to the profile's other gateway state, so each agent keeps
+    its own file and one agent's rooms can never seed another's catch-up.
+    Every mutation writes through: a throttled write would reopen exactly the
+    hole this class exists to close, because a kill between the last write and
+    the crash replays messages the agent already answered.
+    """
+
+    def __init__(self, path: Any, recent_id_cap: int = CATCHUP_RECENT_ID_CAP):
+        from pathlib import Path
+
+        self._path = Path(path)
+        self._cap = max(1, int(recent_id_cap))
+        self._rooms: Dict[str, str] = {}
+        self._recent: List[str] = []
+        self._recent_set: set = set()
+
+    @property
+    def rooms(self) -> Dict[str, str]:
+        """Room id → ISO 8601 timestamp of the newest message seen there."""
+        return dict(self._rooms)
+
+    def load(self) -> None:
+        """Read the state file. A missing or damaged file starts empty.
+
+        Starting empty is the safe direction: with no watermark the catch-up
+        fetches nothing at all, so a corrupted file costs one gap, never a
+        replay of a room's whole history.
+        """
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning(
+                "Rocket.Chat: catch-up state file is unreadable — starting "
+                "without a watermark (no messages will be replayed)"
+            )
+            return
+        if not isinstance(payload, dict):
+            return
+        rooms = payload.get("rooms")
+        if isinstance(rooms, dict):
+            self._rooms = {
+                str(key): str(value)
+                for key, value in list(rooms.items())[:CATCHUP_MAX_ROOMS]
+                if is_valid_server_identifier(key) and isinstance(value, str)
+            }
+        recent = payload.get("recent_ids")
+        if isinstance(recent, list):
+            self._recent = [
+                str(item)
+                for item in recent[-self._cap:]
+                if is_valid_server_identifier(item)
+            ]
+            self._recent_set = set(self._recent)
+
+    def watermark(self, room_id: Any) -> Optional[str]:
+        """Return the newest seen timestamp for *room_id*, if any."""
+        return self._rooms.get(str(room_id))
+
+    def was_seen(self, message_id: Any) -> bool:
+        """Whether this message id was already handled before a restart."""
+        return str(message_id) in self._recent_set
+
+    def note_seen(self, room_id: Any, timestamp: Any, message_id: Any) -> None:
+        """Record a message as handled and persist immediately."""
+        room = str(room_id)
+        mid = str(message_id)
+        if not is_valid_server_identifier(room) or not is_valid_server_identifier(mid):
+            return
+
+        changed = False
+        posted_at = parse_rocketchat_timestamp(timestamp)
+        if posted_at is not None:
+            current = parse_rocketchat_timestamp(self._rooms.get(room))
+            if current is None or posted_at > current:
+                self._rooms[room] = format_rocketchat_timestamp(posted_at)
+                changed = True
+                if len(self._rooms) > CATCHUP_MAX_ROOMS:
+                    # Drop the least recently active rooms, not arbitrary ones.
+                    ordered = sorted(
+                        self._rooms.items(),
+                        key=lambda item: parse_rocketchat_timestamp(item[1]) or 0.0,
+                    )
+                    self._rooms = dict(ordered[-CATCHUP_MAX_ROOMS:])
+
+        if mid not in self._recent_set:
+            self._recent.append(mid)
+            self._recent_set.add(mid)
+            changed = True
+            while len(self._recent) > self._cap:
+                self._recent_set.discard(self._recent.pop(0))
+
+        if changed:
+            self._save()
+
+    def _save(self) -> None:
+        """Write the state file atomically; never raise into the caller."""
+        payload = {
+            "version": CATCHUP_STATE_VERSION,
+            "rooms": self._rooms,
+            "recent_ids": self._recent,
+        }
+        tmp = self._path.with_name(self._path.name + ".tmp")
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(
+                json.dumps(payload, sort_keys=True), encoding="utf-8"
+            )
+            os.replace(tmp, self._path)
+        except OSError as exc:
+            logger.warning(
+                "Rocket.Chat: could not persist catch-up state (%s) — a restart "
+                "may miss messages",
+                type(exc).__name__,
+            )
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def build_delegation_envelope(kind: str, delegation_id: str, text: str) -> str:

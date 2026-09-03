@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List
@@ -18,13 +19,21 @@ from urllib.parse import quote
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 
 from .helpers import (
+    CATCHUP_MAX_ROOMS,
+    CATCHUP_MAX_TOTAL_MESSAGES,
     MediaDownloadTooLarge,
     _ROOM_TYPE_MAP,
+    catchup_enabled,
+    catchup_max_age_seconds,
+    catchup_max_messages,
+    format_rocketchat_timestamp,
+    history_endpoint_for_chat_type,
     is_mutation_republish,
     is_valid_server_identifier,
     is_valid_url_path_identifier,
     media_download_max_bytes,
     parse_delegation_envelope,
+    parse_rocketchat_timestamp,
     read_bounded_response_bytes,
     validate_auth_config,
 )
@@ -341,6 +350,14 @@ class InboundMixin:
         room_id = post.get("rid", "")
         if not is_valid_server_identifier(room_id):
             return
+
+        # Record the message as seen before any gating decision: a message the
+        # adapter deliberately ignores (no mention, wrong sender) must not be
+        # re-fetched by the next catch-up either. Persisted here, so a restart
+        # resumes from this exact point.
+        catchup = getattr(self, "_catchup", None)
+        if catchup is not None:
+            catchup.note_seen(room_id, post.get("ts"), post_id)
 
         # Look up room type lazily; cache forever.
         chat_type = self._room_type_cache.get(room_id)
@@ -680,6 +697,151 @@ class InboundMixin:
         )
 
         await self.handle_message(msg_event)
+
+    async def _run_catchup(self) -> None:
+        """Re-read what arrived while the DDP stream was not listening.
+
+        Called after every successful subscribe, so it covers both a process
+        restart and a plain reconnect. Bounded on every axis that could turn a
+        recovery into a flood: rooms, age, per-room count, an overall budget,
+        and a durable record of what was already handled. Fetched messages go
+        through the normal ``_handle_message`` path, so mention gating,
+        authorization, dedup and the republish guard apply as they do live —
+        which also means most fetched messages are dropped there, exactly as
+        they would have been at the time.
+        """
+        catchup = getattr(self, "_catchup", None)
+        if catchup is None or not catchup_enabled():
+            return
+
+        watermarks = catchup.rooms
+        if not watermarks:
+            # First run after installing this version: nothing was ever
+            # recorded, so there is no honest starting point. Staying silent
+            # beats replaying whatever the history endpoint happens to return.
+            logger.info(
+                "Rocket.Chat: no catch-up watermark yet — skipping "
+                "(the next reconnect will have one)"
+            )
+            return
+
+        max_age = catchup_max_age_seconds()
+        max_messages = catchup_max_messages()
+        # Per-room caps alone still allow rooms × cap messages to land at once.
+        # The budget is what keeps a long outage across many rooms from turning
+        # the recovery into the bigger incident.
+        budget = CATCHUP_MAX_TOTAL_MESSAGES
+        floor = time.time() - max_age
+        replayed = 0
+
+        for room_id, iso in list(watermarks.items())[:CATCHUP_MAX_ROOMS]:
+            if self._closing:
+                return
+            seen_at = parse_rocketchat_timestamp(iso)
+            if seen_at is None:
+                continue
+            if seen_at < floor:
+                # Usually just a quiet room, not a lost conversation — the
+                # watermark simply predates the window. Only a real truncation
+                # (below) is worth a warning.
+                logger.info(
+                    "Rocket.Chat: catch-up for room %s reaches back %.0f "
+                    "minutes at most; the last seen message is older",
+                    room_id,
+                    max_age / 60.0,
+                )
+                seen_at = floor
+            try:
+                replayed += await self._catchup_room(
+                    room_id, seen_at, min(max_messages, budget - replayed)
+                )
+            except Exception:
+                logger.warning(
+                    "Rocket.Chat: catch-up for one room failed", exc_info=True
+                )
+            if replayed >= budget:
+                logger.warning(
+                    "Rocket.Chat: catch-up stopped at the overall budget of "
+                    "%d messages — remaining rooms stay unread until someone "
+                    "writes in them again",
+                    budget,
+                )
+                break
+
+        if replayed:
+            # Counted at the fetch, not at the agent: normal inbound gating
+            # still decides which of these actually reach a turn.
+            logger.info(
+                "Rocket.Chat: catch-up re-fed %d missed message(s) into the "
+                "inbound path", replayed
+            )
+
+    async def _catchup_room(
+        self, room_id: str, oldest: float, limit: int
+    ) -> int:
+        """Fetch and dispatch messages posted in *room_id* after *oldest*."""
+        chat_type = self._room_type_cache.get(room_id)
+        if chat_type is None:
+            chat_type = await self._resolve_room_type(room_id)
+        endpoint = history_endpoint_for_chat_type(chat_type)
+        if not endpoint:
+            return 0
+
+        data = await self._api_get(
+            endpoint,
+            {
+                "roomId": room_id,
+                "oldest": format_rocketchat_timestamp(oldest),
+                "count": limit,
+                "inclusive": "false",
+                # Thread replies are excluded by default — and a threaded
+                # conversation is precisely where the missed messages are.
+                "showThreadMessages": "true",
+            },
+        )
+        if not isinstance(data, dict) or data.get("success") is not True:
+            return 0
+        messages = data.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return 0
+
+        selected = messages[:limit]
+        if any(
+            not isinstance(message, dict) or message.get("rid") != room_id
+            for message in selected
+        ):
+            logger.warning(
+                "Rocket.Chat: catch-up response for room %s carried foreign "
+                "messages — discarding the batch",
+                room_id,
+            )
+            return 0
+        if len(selected) >= limit:
+            # The batch came back full, so the room may hold more than the cap
+            # allows. Unlike the age clamp this is a real, detectable loss.
+            logger.warning(
+                "Rocket.Chat: room %s returned the full catch-up limit of %d "
+                "messages — anything older than those stays unread",
+                room_id,
+                limit,
+            )
+
+        # The history endpoint returns newest-first; replay in the order the
+        # conversation actually happened.
+        selected.sort(
+            key=lambda message: parse_rocketchat_timestamp(message.get("ts")) or 0.0
+        )
+
+        replayed = 0
+        for message in selected:
+            if self._closing:
+                break
+            message_id = message.get("_id")
+            if self._catchup.was_seen(message_id):
+                continue
+            await self._handle_message(message)
+            replayed += 1
+        return replayed
 
     async def _resolve_room_type(self, room_id: str) -> str:
         """Look up a room's type via REST. Defaults to 'channel' on failure."""

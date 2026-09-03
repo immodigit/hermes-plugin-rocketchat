@@ -76,6 +76,21 @@ RC's `rooms.media` has no direct audio transcoding, so ffmpeg is required.
 - System messages filtered by `"t"` field (join/leave/role changes, etc.)
 - Reconnect: exponential backoff 2s–60s
 
+**The stream has no backlog.** `stream-room-messages` delivers only what is
+posted while the socket is open — there is no server-side queue and no replay
+on subscribe. Everything sent during a restart or a network blip is lost to the
+adapter while remaining visible in the channel, so the gap is invisible from
+both ends. `_run_catchup()` closes it: after every successful subscribe it
+re-reads each known room from a durable per-room watermark
+(`rocketchat_catchup.json` in the profile's Hermes home) through the normal
+`_handle_message()` path, so mention gating, authorization, dedup and the
+republish guard all still apply. Note that `*.history` omits thread replies
+unless `showThreadMessages=true` — and a threaded conversation is exactly where
+the missed messages are. Bounds that must not be removed: no watermark means no
+fetch at all (a fresh install must never replay a room's past), plus caps on
+age, per-room count, total count, and a durable list of recently handled ids
+that survives the in-memory dedup cache being empty after a restart.
+
 **The stream carries mutations, not just new posts.** Rocket.Chat republishes a
 whole message document whenever it changes — a thread reply bumps the root's
 `tcount`/`tlm`, a reaction (including the adapter's own ✅ completion marker),

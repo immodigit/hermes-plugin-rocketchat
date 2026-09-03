@@ -45,6 +45,13 @@ Environment variables:
     ROCKETCHAT_MEDIA_DOWNLOAD_MAX_BYTES  Network-media byte budget
     ROCKETCHAT_FORWARDED_SLASH_COMMANDS  Exact RC-native command allowlist
     ROCKETCHAT_TOPIC_SYNC             Enable room-topic writes (default: false)
+    ROCKETCHAT_WS_HEARTBEAT_SECONDS   WebSocket keepalive (default: 30; 0 disables)
+    ROCKETCHAT_CATCHUP                Re-read messages missed while the stream
+                                      was down (default: true)
+    ROCKETCHAT_CATCHUP_MAX_AGE_SECONDS  How far back a catch-up may reach
+                                        (default: 3600)
+    ROCKETCHAT_CATCHUP_MAX_MESSAGES   Replay cap per room and reconnect
+                                      (default: 20)
 """
 
 from .adapter import RocketchatAdapter

@@ -8,6 +8,7 @@ available; this path setting alone does not install them.
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 _HERMES = Path(
@@ -24,3 +25,10 @@ if not (_HERMES / "gateway").is_dir():
     )
 
 sys.path.insert(0, str(_HERMES))
+
+
+# The adapter persists its catch-up watermark under the Hermes home.  Point
+# that at a throwaway directory so the suite never writes into the
+# developer's real ~/.hermes.
+_TEST_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-rocketchat-tests-")
+os.environ["HERMES_HOME"] = _TEST_HERMES_HOME

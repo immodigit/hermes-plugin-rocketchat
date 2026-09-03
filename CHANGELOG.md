@@ -1,5 +1,38 @@
 # Changelog
 
+## [1.5.0] - 2026-09-03
+
+### Added
+
+- Catch-up on reconnect: messages posted while the DDP stream was down are
+  re-read and dispatched after every successful subscribe. Rocket.Chat's
+  realtime stream has no server-side queue and `connect()` never asked for a
+  backlog, so a restart or a network blip dropped messages silently — visible
+  in the channel to the sender, never seen by the agent. A measured rollout
+  restart left a 65-second hole.
+
+  Each room carries a durable watermark in `rocketchat_catchup.json` under the
+  profile's Hermes home, so agents in a multi-profile gateway never share or
+  replay each other's rooms. Fetched messages go through the normal inbound
+  path, so mention gating, authorization, dedup and the republish guard apply
+  unchanged. `showThreadMessages=true` is required and set: `*.history` omits
+  thread replies by default, which is precisely where a threaded
+  conversation's missed messages live.
+
+  Bounded deliberately — a careless recovery is worse than the gap it closes:
+  no watermark means no fetch (a fresh install never replays a room's past),
+  and age, per-room count and overall count are all capped. A durable list of
+  recently handled message ids covers the one case the watermark cannot: an
+  unclean kill between handling a message and persisting the watermark, where
+  the in-memory dedup cache starts empty after the restart.
+
+- `ROCKETCHAT_CATCHUP` (default `true`), `ROCKETCHAT_CATCHUP_MAX_AGE_SECONDS`
+  (default 3600) and `ROCKETCHAT_CATCHUP_MAX_MESSAGES` (default 20).
+
+### Fixed
+
+- The test suite no longer writes into the developer's real `~/.hermes`.
+
 ## [1.4.2] - 2026-09-03
 
 ### Fixed

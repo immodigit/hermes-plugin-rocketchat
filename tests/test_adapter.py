@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -71,6 +72,7 @@ register = _rc.register
 _env_enablement = _rc._env_enablement
 _plugin_helpers = sys.modules["rocketchat_plugin.helpers"]
 _plugin_media = sys.modules["rocketchat_plugin.media"]
+_plugin_inbound = sys.modules["rocketchat_plugin.inbound"]
 validate_server_url = _plugin_helpers.validate_server_url
 websocket_endpoint_matches = _plugin_helpers.websocket_endpoint_matches
 websocket_url = _plugin_helpers.websocket_url
@@ -955,6 +957,236 @@ class TestRepublishDetection:
     def test_missing_timestamps_fall_through_to_dedup(self):
         assert not _plugin_helpers.is_mutation_republish({"msg": "hello"})
         assert not _plugin_helpers.is_mutation_republish("not-a-dict")
+
+
+# ---------------------------------------------------------------------------
+# Catch-up after a gap in the stream
+# ---------------------------------------------------------------------------
+
+
+def _catchup_state(tmp_path, **env):
+    state = _plugin_helpers.CatchupState(tmp_path / "catchup.json")
+    state.load()
+    return state
+
+
+class TestCatchupState:
+    def test_roundtrip_across_instances(self, tmp_path):
+        state = _catchup_state(tmp_path)
+        state.note_seen("room1", "2026-09-03T10:45:17.864Z", "m1")
+
+        reloaded = _plugin_helpers.CatchupState(tmp_path / "catchup.json")
+        reloaded.load()
+        assert reloaded.watermark("room1") == "2026-09-03T10:45:17.864Z"
+        assert reloaded.was_seen("m1")
+
+    def test_watermark_never_moves_backwards(self, tmp_path):
+        state = _catchup_state(tmp_path)
+        state.note_seen("room1", "2026-09-03T12:00:00.000Z", "m2")
+        state.note_seen("room1", "2026-09-03T10:00:00.000Z", "m1")
+        assert state.watermark("room1") == "2026-09-03T12:00:00.000Z"
+
+    def test_ejson_dates_accepted(self, tmp_path):
+        state = _catchup_state(tmp_path)
+        state.note_seen("room1", {"$date": 1788432317864}, "m1")
+        assert state.watermark("room1") == "2026-09-03T10:45:17.864Z"
+
+    def test_recent_ids_are_capped(self, tmp_path):
+        state = _plugin_helpers.CatchupState(
+            tmp_path / "catchup.json", recent_id_cap=3
+        )
+        for i in range(6):
+            state.note_seen("room1", {"$date": 1788432317864 + i}, f"m{i}")
+        assert not state.was_seen("m0")
+        assert state.was_seen("m5")
+
+    def test_corrupt_file_starts_empty_instead_of_replaying(self, tmp_path):
+        path = tmp_path / "catchup.json"
+        path.write_text("{ this is not json", encoding="utf-8")
+        state = _plugin_helpers.CatchupState(path)
+        state.load()
+        # Empty means "fetch nothing" — the safe direction.
+        assert state.rooms == {}
+
+    def test_unwritable_path_does_not_raise(self, tmp_path):
+        state = _plugin_helpers.CatchupState(tmp_path / "nope" / "x" / "c.json")
+        blocker = tmp_path / "nope"
+        blocker.write_text("not a directory", encoding="utf-8")
+        state.note_seen("room1", "2026-09-03T10:45:17.864Z", "m1")
+        assert state.was_seen("m1")  # in-memory state still correct
+
+    def test_history_endpoints_per_room_type(self):
+        assert _plugin_helpers.history_endpoint_for_chat_type("channel") == (
+            "channels.history"
+        )
+        assert _plugin_helpers.history_endpoint_for_chat_type("group") == (
+            "groups.history"
+        )
+        assert _plugin_helpers.history_endpoint_for_chat_type("dm") == "im.history"
+        assert _plugin_helpers.history_endpoint_for_chat_type("livechat") is None
+
+
+class TestCatchupFetch:
+    def _adapter(self, tmp_path, room_type="group"):
+        adapter = _wired_adapter(room_type=room_type)
+        adapter._catchup = _plugin_helpers.CatchupState(tmp_path / "c.json")
+        adapter._catchup.load()
+        adapter._api_get = AsyncMock(return_value={"success": False})
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_no_watermark_fetches_nothing(self, tmp_path):
+        """The dangerous case: a fresh install must not replay a room's past."""
+        adapter = self._adapter(tmp_path)
+        await adapter._run_catchup()
+        adapter._api_get.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missed_messages_are_replayed_oldest_first(self, tmp_path):
+        adapter = self._adapter(tmp_path)
+        adapter._catchup.note_seen("room1", "2026-09-03T10:00:00.000Z", "seen1")
+        now_ms = int(time.time() * 1000)
+        adapter._api_get = AsyncMock(return_value={
+            "success": True,
+            "messages": [
+                {"_id": "b", "rid": "room1", "msg": "@hermesbot zweitens",
+                 "ts": {"$date": now_ms - 1000},
+                 "_updatedAt": {"$date": now_ms - 1000},
+                 "u": {"_id": "u1", "username": "alice"}},
+                {"_id": "a", "rid": "room1", "msg": "@hermesbot erstens",
+                 "ts": {"$date": now_ms - 2000},
+                 "_updatedAt": {"$date": now_ms - 2000},
+                 "u": {"_id": "u1", "username": "alice"}},
+            ],
+        })
+        adapter._catchup.note_seen(
+            "room1", _plugin_helpers.format_rocketchat_timestamp(time.time() - 60),
+            "seen2",
+        )
+
+        await adapter._run_catchup()
+
+        endpoint, params = adapter._api_get.await_args[0]
+        assert endpoint == "groups.history"
+        # Thread replies are excluded by default — and that is where the
+        # missed messages of a threaded conversation live.
+        assert params["showThreadMessages"] == "true"
+        assert params["inclusive"] == "false"
+        texts = [c[0][0].text for c in adapter.handle_message.await_args_list]
+        assert texts == ["erstens", "zweitens"]
+
+    @pytest.mark.asyncio
+    async def test_already_handled_message_is_not_replayed(self, tmp_path):
+        """Survives an unclean kill: the id outlives the in-memory dedup."""
+        adapter = self._adapter(tmp_path)
+        now_ms = int(time.time() * 1000)
+        adapter._catchup.note_seen(
+            "room1", {"$date": now_ms - 5000}, "already-done"
+        )
+        adapter._api_get = AsyncMock(return_value={
+            "success": True,
+            "messages": [
+                {"_id": "already-done", "rid": "room1", "msg": "@hermesbot alt",
+                 "ts": {"$date": now_ms - 1000},
+                 "_updatedAt": {"$date": now_ms - 1000},
+                 "u": {"_id": "u1", "username": "alice"}},
+            ],
+        })
+        await adapter._run_catchup()
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_foreign_room_batch_is_discarded(self, tmp_path):
+        adapter = self._adapter(tmp_path)
+        now_ms = int(time.time() * 1000)
+        adapter._catchup.note_seen("room1", {"$date": now_ms - 5000}, "seen1")
+        adapter._api_get = AsyncMock(return_value={
+            "success": True,
+            "messages": [
+                {"_id": "x", "rid": "SOMEWHERE-ELSE", "msg": "@hermesbot hi",
+                 "ts": {"$date": now_ms - 1000},
+                 "_updatedAt": {"$date": now_ms - 1000},
+                 "u": {"_id": "u1", "username": "alice"}},
+            ],
+        })
+        await adapter._run_catchup()
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_outage_older_than_the_limit_is_clamped(self, tmp_path, monkeypatch):
+        """A long outage must not resurrect yesterday's questions."""
+        monkeypatch.setenv("ROCKETCHAT_CATCHUP_MAX_AGE_SECONDS", "600")
+        adapter = self._adapter(tmp_path)
+        adapter._catchup.note_seen("room1", "2020-01-01T00:00:00.000Z", "ancient")
+        adapter._api_get = AsyncMock(return_value={"success": True, "messages": []})
+
+        await adapter._run_catchup()
+
+        _, params = adapter._api_get.await_args[0]
+        oldest = _plugin_helpers.parse_rocketchat_timestamp(params["oldest"])
+        assert oldest == pytest.approx(time.time() - 600, abs=30)
+
+    @pytest.mark.asyncio
+    async def test_overall_budget_caps_a_wide_outage(self, tmp_path, monkeypatch):
+        """Many rooms x per-room cap must not become one giant burst."""
+        monkeypatch.setattr(
+            _plugin_inbound, "CATCHUP_MAX_TOTAL_MESSAGES", 3, raising=False
+        )
+        adapter = self._adapter(tmp_path)
+        now_ms = int(time.time() * 1000)
+        for room in ("room1", "room2", "room3", "room4"):
+            adapter._catchup.note_seen(room, {"$date": now_ms - 5000}, f"s-{room}")
+        adapter._room_type_cache.update(
+            {r: "group" for r in ("room1", "room2", "room3", "room4")}
+        )
+
+        async def _history(endpoint, params):
+            rid = params["roomId"]
+            return {"success": True, "messages": [
+                {"_id": f"{rid}-{i}", "rid": rid, "msg": "@hermesbot hallo",
+                 "ts": {"$date": now_ms - 1000 + i},
+                 "_updatedAt": {"$date": now_ms - 1000 + i},
+                 "u": {"_id": "u1", "username": "alice"}}
+                for i in range(2)
+            ]}
+
+        adapter._api_get = AsyncMock(side_effect=_history)
+        await adapter._run_catchup()
+
+        assert adapter.handle_message.await_count <= 3
+
+    @pytest.mark.asyncio
+    async def test_disabled_by_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ROCKETCHAT_CATCHUP", "false")
+        adapter = self._adapter(tmp_path)
+        adapter._catchup.note_seen("room1", "2026-09-03T10:00:00.000Z", "seen1")
+        await adapter._run_catchup()
+        adapter._api_get.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handling_a_live_message_advances_the_watermark(self, tmp_path):
+        adapter = self._adapter(tmp_path, room_type="dm")
+        await adapter._handle_message(_post(
+            post_id="live1",
+            ts="2026-09-03T12:00:00.000Z",
+            _updatedAt="2026-09-03T12:00:00.000Z",
+        ))
+        assert adapter._catchup.watermark("room1") == "2026-09-03T12:00:00.000Z"
+        assert adapter._catchup.was_seen("live1")
+
+    @pytest.mark.asyncio
+    async def test_ignored_message_still_advances_the_watermark(self, tmp_path):
+        """A message we chose not to answer must not come back on reconnect."""
+        adapter = self._adapter(tmp_path, room_type="group")
+        await adapter._handle_message(_post(
+            post_id="nomention",
+            msg="kein bot gemeint",
+            ts="2026-09-03T12:00:00.000Z",
+            _updatedAt="2026-09-03T12:00:00.000Z",
+        ))
+        adapter.handle_message.assert_not_awaited()
+        assert adapter._catchup.was_seen("nomention")
 
 
 # ---------------------------------------------------------------------------

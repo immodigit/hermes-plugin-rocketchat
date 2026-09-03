@@ -54,6 +54,23 @@ class DdpTransportMixin:
         })
         return sub_id
 
+    def _spawn_catchup(self) -> None:
+        """Start one catch-up run, dropping the request if one is in flight."""
+        lock = getattr(self, "_catchup_lock", None)
+        if lock is None or lock.locked():
+            return
+
+        async def _guarded() -> None:
+            async with lock:
+                try:
+                    await self._run_catchup()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning("Rocket.Chat: catch-up failed", exc_info=True)
+
+        self._catchup_task = asyncio.create_task(_guarded())
+
     async def _ws_loop(self) -> None:
         """Connect to the DDP socket and listen for events, reconnecting on failure."""
         delay = _RECONNECT_BASE_DELAY
@@ -120,6 +137,12 @@ class DdpTransportMixin:
 
         await self._ddp_sub("stream-room-messages", ["__my_messages__", False])
         logger.info("Rocket.Chat: DDP logged in and subscribed")
+
+        # Catch up on the gap this connection just closed.  Deliberately after
+        # the subscription (so nothing falls between fetch and stream) and as a
+        # background task (so the read loop starts immediately).  Overlap with
+        # the live stream is absorbed by the inbound dedup cache.
+        self._spawn_catchup()
 
         async for raw_msg in self._ws:
             if self._closing:
