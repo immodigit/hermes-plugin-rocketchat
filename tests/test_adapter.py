@@ -1671,6 +1671,46 @@ class TestHandleMessage:
         assert event.internal is True
 
     @pytest.mark.asyncio
+    async def test_hermes_022_wrapped_handler_uses_adapter_authorization(self):
+        # Hermes 0.22 wires a closure (_standalone_scoped), not a bound runner
+        # method, and exposes the allowlist via set_authorization_check.
+        # v1.5.0 found no checker there and dropped every inbound message.
+        async def wrapped(event):
+            return None
+
+        seen = []
+        adapter = _wired_adapter(room_type="dm")
+        adapter._inbound_authorization_checker = None
+        adapter._message_handler = wrapped
+        adapter.set_authorization_check(
+            lambda user_id, chat_type=None, chat_id=None, **_: seen.append(user_id) or True
+        )
+
+        await adapter._handle_message(_post(msg="hallo"))
+
+        assert seen == ["u1"]
+        event = adapter.handle_message.await_args.args[0]
+        # Not internal: the gateway still runs its own full admission.
+        assert event.internal is False
+
+    @pytest.mark.asyncio
+    async def test_hermes_022_adapter_authorization_denial_drops_before_effects(self):
+        async def wrapped(event):
+            return None
+
+        adapter = _wired_adapter(room_type="channel")
+        adapter._inbound_authorization_checker = None
+        adapter._message_handler = wrapped
+        adapter._fetch_thread_context = AsyncMock()
+        adapter.set_authorization_check(lambda *a, **k: False)
+
+        await adapter._handle_message(_post(msg="/giphy cat", tmid="t1"))
+
+        adapter.handle_message.assert_not_awaited()
+        adapter._api_post.assert_not_awaited()
+        adapter._fetch_thread_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_unauthorized_dm_pairs_once_before_any_adapter_effect(self):
         class Runner:
             session_store = None

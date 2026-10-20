@@ -263,6 +263,27 @@ class InboundMixin:
         if not callable(checker):
             checker = getattr(handler_owner, "_is_user_authorized", None)
         if not callable(checker):
+            # Hermes >= 0.22: the runner wires a wrapped handler (no __self__)
+            # and exposes the platform-bound allowlist via set_authorization_check.
+            adapter_check = getattr(self, "_authorization_check", None)
+            if callable(adapter_check):
+                source = event.source
+                if source is None or source.user_id is None:
+                    return None
+                try:
+                    allowed = adapter_check(
+                        source.user_id,
+                        getattr(source, "chat_type", None),
+                        getattr(source, "chat_id", None),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Rocket.Chat adapter authorization check failed (%s)",
+                        type(exc).__name__,
+                    )
+                    return None
+                # Not marked internal: the gateway runs its own full admission.
+                return event if allowed is True else None
             logger.error("Rocket.Chat inbound admission checker is unavailable")
             return None
 
