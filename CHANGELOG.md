@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.5.1] - 2026-10-20
+
+### Fixed
+
+- Hermes Agent 0.22: every inbound message was dropped with "Rocket.Chat
+  inbound admission checker is unavailable". 0.22 wires the message handler
+  as a scoped closure instead of a bound GatewayRunner method, so the
+  adapter found no `_is_user_authorized` via `__self__`. The adapter now
+  falls back to the platform-bound check the runner installs through
+  `set_authorization_check(user_id, chat_type, chat_id)`. Such an event is
+  not marked internal, so the gateway still runs its own full admission.
+  Older runtimes keep the previous path unchanged.
+
 ## [1.5.0] - 2026-09-03
 
 ### Added
